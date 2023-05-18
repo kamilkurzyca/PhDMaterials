@@ -1,0 +1,277 @@
+
+#install.packages("missForest")
+#install.packages("mi")
+#install.packages("Hmisc")
+#install.packages("caTools")
+#install.packages("usdm")
+#install.packages("tree")
+#install.packages("DMwR")
+#install.packages("plm")
+library(plm)
+library(usdm)
+library(tree)
+library(Hmisc)
+library(missForest)
+library(mi)
+library(MASS)
+library(stats)
+library(dplyr)
+library(caTools)
+library(DMwR)
+library(rpart)
+library(data.table)
+#import danych
+
+# na początku czyszczenie danych odrzucenie wartości nieliczbowych oraz pewnych zmiennych 
+#dla których określenie istotności statystyczne nie ma sensu bo brakuje 50%+
+###
+non_numerical<-function(train){
+  cnt<-0
+  name_list<-c()
+  for(k in train){
+    cnt<-cnt+1
+    cnt_na<-0
+    for(i in k){
+      if(is.na(i) | !is.numeric(i) ){
+        cnt_na<-cnt_na+1
+      }
+    }
+    
+    if(cnt_na/length(k)>0.5){
+      name_list<-c(name_list,colnames(train)[cnt])
+    }
+    
+  }
+  train<-train[ , !(names(train) %in% name_list)]
+  
+  return(train)
+}
+#standaryzacja próbki za pomoca sredniej oraz odchylenia starndardowego (x-m)/std
+standarization<-function(train){
+  sr<-mean(train[['class']])
+  od<-sd(train[['class']])
+  train.preproc <- as.data.frame(scale(train))
+  train.preproc[,c(length(train.preproc))]<-train.preproc[,c(length(train.preproc))]*od+sr
+  return(train.preproc)
+}
+#imputacja wszystkich brakujacych danych za pomoca sredniej
+imputation<-function(train.preproc){
+  for(k in names(train.preproc)){
+    train.preproc[[k]]<-impute(train.preproc[[k]],mean)
+  }
+  return(train.preproc)
+}
+#usuniecie wspoliniowosci za pomoca wspolczynnika vif tutaj wyjaśnienie
+#The VIF may be calculated for each predictor by doing a linear regression of that predictor 
+#on all the other predictors, 
+#and then obtaining the R2 from that regression. The VIF is just 1/(1-R2).
+coolinearity<-function(train.preproc){
+  vif_list<-vif(train.preproc)
+  for(s in 1:nrow(vif_list)){
+    if(vif_list[2][[1]][s]>4){
+      train.preproc<-train.preproc[, !(colnames(train.preproc) %in% c(names(train.preproc)[s]))]
+      
+    }
+  }
+  return(train.preproc)
+}
+
+#feture selection za pomoca lasow losowcyh polega na porownaniu wyniku ktory zwraca drzewo decyzyjne wywolane na 
+#pewnej probie walidacyjnej z wynikiem tego samego drzewa walidacyjnego na probie zmienionej w ten sposob ze 
+#i-ta zmienna objasniajaca jest przepermutowana (oczysicie premutaja powinna zmiennic wynik) jesli wynik pozostaje 
+#niezmieniony zmienna ta jest nieistotna
+require(randomForest)
+
+importance_forest<-function(train.preproc){
+  fit=randomForest(class~., data=train.preproc)
+  imporatnce_list<-round(importance(fit), 2)
+  for(s in 1:nrow(imporatnce_list)){
+    if(imporatnce_list[s]>20){
+      train.preproc1<-train.preproc[,c(names(train.preproc)[s])]
+      
+    }
+    train.preproc1=rbind(train.preproc1,train.preproc$class)
+  }
+  return(train.preproc)
+}
+#cross validacja i wybor klasyfikatorow, sprawdzian krzyzowy poleca na podzieleniu probki na "n" podzbiorow a nastepnie
+#dla kazdego z tych i\in n podzbiorow na nauczeniu modelu na pozostalych n-1 pozdbiorach i validacji na i-tym podzbiorze
+#############################################
+# cross validacja regresja logistyczna
+logistic_cv<-function(n_folds,train.preproc){
+  summary=0
+  folds_i <- sample(rep(1:n_folds, length.out = nrow(train.preproc)))
+  for (k in 1:n_folds){
+    test_i <- which(folds_i == k)
+    train <- train.preproc[-test_i, ]
+    test <- train.preproc[test_i, ]
+    model_logistic=glm(class ~., data=train,family=binomial)
+    pred_logistic=predict(model_logistic,newdata=test,type='response')
+    pred_logistic<-ifelse(pred_logistic>0.5,1,0)
+    misClasificError <- mean(pred_logistic != test$class)
+    summary=summary+(1-misClasificError)
+  }
+  return(summary/n_folds)
+}
+# cross validacja random forest
+#############################################
+forest_cv<-function(n_folds,train.preproc,nt=10){
+  require(randomForest)
+  summary=0
+  folds_i <- sample(rep(1:n_folds, length.out = nrow(train.preproc)))
+  for (k in 1:n_folds){
+    test_i <- which(folds_i == k)
+    train <- train.preproc[-test_i, ]
+    test <- train.preproc[test_i, ]
+    model_forest=randomForest(class~., data=train,ntree=nt)
+    pred_forest=predict(model_forest,newdata=test)
+    pred_forest<-ifelse(pred_forest>0.5,1,0)
+    misClasificError <- mean(pred_forest != test$class)
+    summary=summary+(1-misClasificError)
+  }
+  return(summary/n_folds)
+}
+# cross validacja lda
+#############################################
+lda_cv<-function(n_folds,train.preproc){
+  summary=0
+  folds_i <- sample(rep(1:n_folds, length.out = nrow(train.preproc)))
+  for (k in 1:n_folds){
+    test_i <- which(folds_i == k)
+    train <- train.preproc[-test_i, ]
+    test <- train.preproc[test_i, ]
+    model=lda(class~., data=train)
+    pred=predict(model,newdata=test)$class
+    misClasificError <- mean(pred != test$class)
+    summary=summary+(1-misClasificError)
+  }
+  return(summary/n_folds)
+}
+
+# cross validacja qda
+#############################################
+qda_cv<-function(n_folds,train.preproc){
+  summary=0
+  folds_i <- sample(rep(1:n_folds, length.out = nrow(train.preproc)))
+  for (k in 1:n_folds){
+    test_i <- which(folds_i == k)
+    train <- train.preproc[-test_i, ]
+    test <- train.preproc[test_i, ]
+    model=qda(class~., data=train)
+    pred=predict(model,newdata=test)$class
+    misClasificError <- mean(pred != test$class)
+    summary=summary+(1-misClasificError)
+  }
+  return(summary/n_folds)
+}
+
+#cross validacja drzewo
+#############################################
+tree_cv<-function(n_folds,train.preproc){
+  require(tree)
+  summary=0
+  folds_i <- sample(rep(1:n_folds, length.out = nrow(train.preproc)))
+  for (k in 1:n_folds){
+    test_i <- which(folds_i == k)
+    train <- train.preproc[-test_i, ]
+    test <- train.preproc[test_i, ]
+    model <- tree(class~., data=train)
+    pred=predict(model,newdata=test)
+
+    pred<-ifelse(pred>0.5,1,0)
+    misClasificError <- mean(pred != test$class)
+    summary=summary+(1-misClasificError)
+  }
+  return(summary/n_folds)
+}
+#############################################
+set.seed(123)
+#train <- fread('http://www.math.us.edu.pl/pkozyra/DM/train.txt')
+#na początku trzeba władować z pliku obydwa zbiory uczacy i treningowy
+#wyrzucenie nienumerycznych wartosci i kolumn prawie pustych
+train.preproc<-non_numerical(train)
+#standaryzujemy próbke
+train.preproc<-standarization(train.preproc)
+#współiniowość
+train.preproc<-coolinearity(train.preproc)
+#imputacja próbki
+train.preproc<-imputation(train.preproc)
+#train.preproc$class <- ifelse(train.preproc$class>0.5,1,0)
+#train.preproc$class <- as.factor(train.preproc$class)
+#bilansujemy probke 
+out <- split( train.preproc , f = train.preproc$class )
+train_0<-out[[1]]
+train_1<-out[[2]]
+s<-2*length(train_1[[1]])
+train_0<-train_0[c(1:s),]
+train.preproc<-rbind(train_0,train_1)
+train.preproc <- train.preproc[sample(nrow(train.preproc)),]
+#test istotniości parametrów
+train.preproc<-importance_forest(train.preproc)
+#############################################
+#cross validacja różnych klasyfikatorów
+print(logistic_cv(10,train.preproc))
+print(forest_cv(10,train.preproc,30))
+print(qda_cv(10,train.preproc))
+print(lda_cv(10,train.preproc))
+print(tree_cv(10,train.preproc))
+#testy z confiusion matrix
+###############################
+smp_size <- floor(0.75 * nrow(train.preproc))
+set.seed(123)
+train_ind <- sample(seq_len(nrow(train.preproc)), size = smp_size)
+train_con <- train.preproc[train_ind, ]
+test_con <- train.preproc[-train_ind, ]
+#regresja logistyczna
+model_logistic=glm(class ~., data=train_con,family=binomial)
+pred_logistic=predict(model_logistic,newdata=test_con,type='response')
+table(test_con$class, pred_logistic > 0.5)
+sum(diag(table(test_con$class, pred_logistic > 0.5)))/sum(table(test_con$class, pred_logistic > 0.5))
+#lda
+model_lda=lda(class~., data=train_con)
+pred_lda=predict(model_lda,newdata=test_con)$posterior[,2]
+table(test_con$class, pred_lda>0.5)
+sum(diag(table(test_con$class, pred_lda > 0.5)))/sum(table(test_con$class, pred_lda > 0.5))
+#tree
+model_tree <- tree(class~., data=train_con)
+pred_tree=predict(model_tree,newdata=test_con)
+table(test_con$class, pred_tree>0.5)
+sum(diag(table(test_con$class, pred_tree > 0.5)))/sum(table(test_con$class, pred_tree > 0.5))
+#forest
+model_forest=randomForest(class~., data=train_con,ntree=100)
+pred_forest=predict(model_forest,newdata=test_con)
+table(test_con$class, pred_forest >0.5)
+sum(diag(table(test_con$class, pred_forest > 0.5)))/sum(table(test_con$class, pred_forest > 0.5))
+#ostateczne zrzucenie plikow 
+#tu trzeba zaimportować plik test
+test<-testx
+################################
+name_list<-c(names(train.preproc))
+test<-test[ ,(names(test) %in% name_list)] 
+test <- as.data.frame(scale(test))
+test<-imputation(test)
+###############################
+#uczymy modele na train
+#regresja logistyczna
+model_logistic=glm(class ~., data=train.preproc,family=binomial)
+pred_logistic=predict(model_logistic,newdata=test,type='response')
+pred_logistic<-ifelse(pred_logistic>0.5,1,0)
+print(pred_logistic)
+#lda
+model_lda=lda(class~., data=train.preproc)
+pred_lda=predict(model_lda,newdata=test)$class
+#pred_lda<-ifelse(pred_lda>0.5,1,0)
+print(pred_lda)
+#tree
+model_tree <- tree(class~., data=train.preproc)
+pred_tree=predict(model_tree,newdata=test)
+pred_tree<-ifelse(pred_tree>0.5,1,0)
+print(pred_tree)
+#forest
+model_forest=randomForest(class~., data=train.preproc,ntree=40)
+pred_forest_validation=predict(model_forest,newdata=test)
+pred_forest=predict(model_forest,newdata=test)
+pred_forest<-ifelse(pred_forest>0.5,1,0)
+print(pred_forest)
+
+
